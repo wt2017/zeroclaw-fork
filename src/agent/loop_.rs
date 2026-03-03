@@ -2503,11 +2503,17 @@ pub async fn run(
         &config,
     );
 
-    let peripheral_tools: Vec<Box<dyn Tool>> =
-        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
-    if !peripheral_tools.is_empty() {
-        tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
-        tools_registry.extend(peripheral_tools);
+    // Under the hardware feature, hardware::boot owns all peripheral tools via
+    // the ToolRegistry and opens the port lazily (no persistent TIOCEXCL lock).
+    // Skip the old peripherals system entirely to avoid blocking mpremote.
+    #[cfg(not(feature = "hardware"))]
+    {
+        let peripheral_tools: Vec<Box<dyn Tool>> =
+            crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
+        if !peripheral_tools.is_empty() {
+            tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
+            tools_registry.extend(peripheral_tools);
+        }
     }
 
     // ── Hardware registry tools (Phase 4 ToolRegistry + plugins) ──
@@ -3149,9 +3155,14 @@ pub async fn process_message_with_session(
         config.api_key.as_deref(),
         &config,
     );
-    let peripheral_tools: Vec<Box<dyn Tool>> =
-        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
-    tools_registry.extend(peripheral_tools);
+    // Same as run(): gate the whole create_peripheral_tools call so the port
+    // is never opened with TIOCEXCL when hardware feature already owns it.
+    #[cfg(not(feature = "hardware"))]
+    {
+        let peripheral_tools: Vec<Box<dyn Tool>> =
+            crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
+        tools_registry.extend(peripheral_tools);
+    }
 
     // ── Hardware registry tools (Phase 4 ToolRegistry + plugins) ──
     let hw_boot = crate::hardware::boot(&config.peripherals).await?;
