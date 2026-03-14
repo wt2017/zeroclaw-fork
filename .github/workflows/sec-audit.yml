@@ -15,6 +15,9 @@ on:
             - ".github/security/unsafe-audit-governance.json"
             - "scripts/ci/install_gitleaks.sh"
             - "scripts/ci/install_syft.sh"
+            - "scripts/ci/ensure_c_toolchain.sh"
+            - "scripts/ci/ensure_cargo_component.sh"
+            - "scripts/ci/self_heal_rust_toolchain.sh"
             - "scripts/ci/deny_policy_guard.py"
             - "scripts/ci/secrets_governance_guard.py"
             - "scripts/ci/unsafe_debt_audit.py"
@@ -22,29 +25,12 @@ on:
             - "scripts/ci/config/unsafe_debt_policy.toml"
             - "scripts/ci/emit_audit_event.py"
             - "scripts/ci/security_regression_tests.sh"
+            - "scripts/ci/ensure_cc.sh"
             - ".github/workflows/sec-audit.yml"
     pull_request:
         branches: [dev, main]
-        paths:
-            - "Cargo.toml"
-            - "Cargo.lock"
-            - "src/**"
-            - "crates/**"
-            - "deny.toml"
-            - ".gitleaks.toml"
-            - ".github/security/gitleaks-allowlist-governance.json"
-            - ".github/security/deny-ignore-governance.json"
-            - ".github/security/unsafe-audit-governance.json"
-            - "scripts/ci/install_gitleaks.sh"
-            - "scripts/ci/install_syft.sh"
-            - "scripts/ci/deny_policy_guard.py"
-            - "scripts/ci/secrets_governance_guard.py"
-            - "scripts/ci/unsafe_debt_audit.py"
-            - "scripts/ci/unsafe_policy_guard.py"
-            - "scripts/ci/config/unsafe_debt_policy.toml"
-            - "scripts/ci/emit_audit_event.py"
-            - "scripts/ci/security_regression_tests.sh"
-            - ".github/workflows/sec-audit.yml"
+        # Do not gate pull_request by paths: main branch protection requires
+        # "Security Required Gate" to always report a status on PRs.
     merge_group:
         branches: [dev, main]
     schedule:
@@ -78,68 +64,81 @@ permissions:
     checks: write
 
 env:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: core.hooksPath
+    GIT_CONFIG_VALUE_0: /dev/null
     CARGO_TERM_COLOR: always
 
 jobs:
-    security-scope:
-        name: Security Scope
-        runs-on: [self-hosted, Linux, X64]
+    # --- Change detection for fast-path on non-Rust PRs ---
+    changes:
+        name: Detect Change Scope
+        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
         outputs:
-            run_heavy: ${{ steps.detect.outputs.run_heavy }}
-        steps:
-            - name: Detect heavy security scope
-              id: detect
-              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-              with:
-                  script: |
-                    if (context.eventName !== "pull_request") {
-                      core.setOutput("run_heavy", "true");
-                      return;
-                    }
-
-                    const files = await github.paginate(
-                      github.rest.pulls.listFiles,
-                      {
-                        owner: context.repo.owner,
-                        repo: context.repo.repo,
-                        pull_number: context.payload.pull_request.number,
-                        per_page: 100,
-                      },
-                    );
-
-                    const isRustSurface = (path) =>
-                      path === "Cargo.toml" ||
-                      path === "Cargo.lock" ||
-                      path.startsWith("src/") ||
-                      path.startsWith("crates/") ||
-                      path.startsWith("tests/");
-
-                    const runHeavy = files.some((file) => isRustSurface(file.filename));
-                    core.info(`Heavy security jobs enabled: ${runHeavy}`);
-                    core.setOutput("run_heavy", runHeavy ? "true" : "false");
-
-    audit:
-        name: Security Audit
-        runs-on: [self-hosted, Linux, X64]
-        timeout-minutes: 20
+            rust_changed: ${{ steps.scope.outputs.rust_changed }}
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+            - name: Detect Rust changes
+              id: scope
+              shell: bash
+              env:
+                  EVENT_NAME: ${{ github.event_name }}
+                  BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
+              run: ./scripts/ci/detect_change_scope.sh
+
+    # --- Consolidated Rust security: audit + deny + security regressions ---
+    # Merges 3 separate Rust-compiling jobs into 1 sequential job on 8 vCPU.
+    rust-security:
+        name: Rust Security (Audit + Deny + Regressions)
+        needs: [changes]
+        if: >-
+            needs.changes.outputs.rust_changed == 'true' ||
+            github.event_name == 'schedule' ||
+            github.event_name == 'workflow_dispatch'
+        runs-on: blacksmith-8vcpu-ubuntu-2404
+        timeout-minutes: 25
+        env:
+            CARGO_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/cargo
+            RUSTUP_HOME: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/rustup
+            CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-rust/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}/target
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Self-heal Rust toolchain cache
+              shell: bash
+              run: ./scripts/ci/self_heal_rust_toolchain.sh 1.92.0
+
+            - name: Ensure C toolchain
+              shell: bash
+              run: bash ./scripts/ci/ensure_c_toolchain.sh
 
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
+            - name: Ensure C toolchain for Rust builds
+              run: ./scripts/ci/ensure_cc.sh
 
+            - name: Ensure cargo component
+              shell: bash
+              env:
+                  ENSURE_CARGO_COMPONENT_STRICT: "true"
+              run: bash ./scripts/ci/ensure_cargo_component.sh 1.92.0
+
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
+              with:
+                  prefix-key: zeroclaw-ci-v1
+                  shared-key: ${{ runner.os }}-rust
+                  cache-targets: true
+                  cache-bin: false
+
+            # --- Step 1: cargo-audit (was: audit job) ---
             - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
               with:
                   token: ${{ secrets.GITHUB_TOKEN }}
 
-    deny:
-        name: License & Supply Chain
-        runs-on: [self-hosted, Linux, X64]
-        timeout-minutes: 20
-        steps:
-            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
+            # --- Step 2: cargo-deny (was: deny job) ---
             - name: Enforce deny policy hygiene
               shell: bash
               run: |
@@ -152,9 +151,46 @@ jobs:
                     --output-md artifacts/deny-policy-guard.md \
                     --fail-on-violation
 
-            - uses: EmbarkStudios/cargo-deny-action@3fd3802e88374d3fe9159b834c7714ec57d6c979 # v2
-              with:
-                  command: check advisories licenses sources
+            - name: Install cargo-deny
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  version="0.19.0"
+                  arch="$(uname -m)"
+                  case "${arch}" in
+                    x86_64|amd64)
+                      target="x86_64-unknown-linux-musl"
+                      expected_sha256="0e8c2aa59128612c90d9e09c02204e912f29a5b8d9a64671b94608cbe09e064f"
+                      ;;
+                    aarch64|arm64)
+                      target="aarch64-unknown-linux-musl"
+                      expected_sha256="2b3567a60b7491c159d1cef8b7d8479d1ad2a31e29ef49462634ad4552fcc77d"
+                      ;;
+                    *)
+                      echo "Unsupported runner architecture for cargo-deny: ${arch}" >&2
+                      exit 1
+                      ;;
+                  esac
+                  install_dir="${RUNNER_TEMP}/cargo-deny-${version}"
+                  archive="${RUNNER_TEMP}/cargo-deny-${version}-${target}.tar.gz"
+                  mkdir -p "${install_dir}"
+                  curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+                    --output "${archive}" \
+                    "https://github.com/EmbarkStudios/cargo-deny/releases/download/${version}/cargo-deny-${version}-${target}.tar.gz"
+                  actual_sha256="$(sha256sum "${archive}" | awk '{print $1}')"
+                  if [ "${actual_sha256}" != "${expected_sha256}" ]; then
+                    echo "Checksum mismatch for cargo-deny ${version} (${target})" >&2
+                    echo "Expected: ${expected_sha256}" >&2
+                    echo "Actual:   ${actual_sha256}" >&2
+                    exit 1
+                  fi
+                  tar -xzf "${archive}" -C "${install_dir}" --strip-components=1
+                  echo "${install_dir}" >> "${GITHUB_PATH}"
+                  "${install_dir}/cargo-deny" --version
+
+            - name: Run cargo-deny checks
+              shell: bash
+              run: cargo-deny check advisories licenses sources
 
             - name: Emit deny audit event
               if: always()
@@ -188,27 +224,27 @@ jobs:
                   if-no-files-found: ignore
                   retention-days: 14
 
-    security-regressions:
-        name: Security Regression Tests
-        needs: [security-scope]
-        if: needs.security-scope.outputs.run_heavy == 'true'
-        runs-on: [self-hosted, Linux, X64]
-        timeout-minutes: 30
-        steps:
-            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-              with:
-                  toolchain: 1.92.0
-            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
-              with:
-                  prefix-key: sec-audit-security-regressions
+            # --- Step 3: Security regression tests (was: security-regressions job) ---
             - name: Run security regression suite
               shell: bash
               run: ./scripts/ci/security_regression_tests.sh
 
+    # --- Fast-path for non-Rust PRs (no compilation needed) ---
+    rust-security-skipped:
+        name: Rust Security (Skipped — Non-Rust PR)
+        needs: [changes]
+        if: >-
+            needs.changes.outputs.rust_changed != 'true' &&
+            github.event_name != 'schedule' &&
+            github.event_name != 'workflow_dispatch'
+        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
+        steps:
+            - name: Skip Rust security for non-Rust PR
+              run: echo "Non-Rust PR; Rust security checks skipped."
+
     secrets:
         name: Secrets Governance (Gitleaks)
-        runs-on: [self-hosted, Linux, X64]
+        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -401,13 +437,15 @@ jobs:
                   if-no-files-found: ignore
                   retention-days: 14
 
-    sbom:
-        name: SBOM Snapshot
-        runs-on: [self-hosted, Linux, X64]
+    # --- Compliance: SBOM + unsafe debt (no Rust compilation needed) ---
+    compliance:
+        name: Compliance (SBOM + Unsafe Debt)
+        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
         timeout-minutes: 20
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+            # --- SBOM (was: sbom job) ---
             - name: Install syft
               shell: bash
               run: |
@@ -466,15 +504,7 @@ jobs:
                   if-no-files-found: ignore
                   retention-days: 14
 
-    unsafe-debt:
-        name: Unsafe Debt Audit
-        needs: [security-scope]
-        if: needs.security-scope.outputs.run_heavy == 'true'
-        runs-on: [self-hosted, Linux, X64]
-        timeout-minutes: 20
-        steps:
-            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
+            # --- Unsafe debt (was: unsafe-debt job) ---
             - name: Enforce unsafe policy governance
               shell: bash
               run: |
@@ -608,38 +638,40 @@ jobs:
     security-required:
         name: Security Required Gate
         if: always() && (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'merge_group')
-        needs: [audit, deny, security-regressions, secrets, sbom, unsafe-debt]
-        runs-on: [self-hosted, Linux, X64]
+        needs: [changes, rust-security, rust-security-skipped, secrets, compliance]
+        runs-on: [self-hosted, Linux, X64, aws-india, light, cpu40]
         steps:
             - name: Enforce security gate
               shell: bash
               run: |
                   set -euo pipefail
-                  results=(
-                    "audit=${{ needs.audit.result }}"
-                    "deny=${{ needs.deny.result }}"
-                    "security-regressions=${{ needs.security-regressions.result }}"
-                    "secrets=${{ needs.secrets.result }}"
-                    "sbom=${{ needs.sbom.result }}"
-                    "unsafe-debt=${{ needs['unsafe-debt'].result }}"
-                  )
-                  for item in "${results[@]}"; do
-                    echo "$item"
-                  done
-                  for item in "${results[@]}"; do
-                    key="${item%%=*}"
-                    result="${item#*=}"
+                  rust_changed="${{ needs.changes.outputs.rust_changed }}"
 
-                    if [ "$key" = "security-regressions" ] || [ "$key" = "unsafe-debt" ]; then
-                      if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
-                        echo "Security gate failed: $item"
-                        exit 1
-                      fi
-                      continue
-                    fi
-
-                    if [ "$result" != "success" ]; then
-                      echo "Security gate failed: $item"
+                  # Rust security: must pass if Rust changed, or must be skipped
+                  if [ "$rust_changed" = "true" ]; then
+                    rust_sec="${{ needs.rust-security.result }}"
+                    if [ "$rust_sec" != "success" ]; then
+                      echo "Security gate failed: rust-security=${rust_sec}"
                       exit 1
                     fi
-                  done
+                  else
+                    rust_skip="${{ needs.rust-security-skipped.result }}"
+                    if [ "$rust_skip" != "success" ]; then
+                      echo "Security gate failed: rust-security-skipped=${rust_skip}"
+                      exit 1
+                    fi
+                  fi
+
+                  # Non-Rust security: always required
+                  secrets_result="${{ needs.secrets.result }}"
+                  compliance_result="${{ needs.compliance.result }}"
+
+                  echo "secrets=${secrets_result}"
+                  echo "compliance=${compliance_result}"
+
+                  if [ "$secrets_result" != "success" ] || [ "$compliance_result" != "success" ]; then
+                    echo "Security gate failed: secrets=${secrets_result} compliance=${compliance_result}"
+                    exit 1
+                  fi
+
+                  echo "All security checks passed."

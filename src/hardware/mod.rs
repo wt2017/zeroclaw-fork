@@ -3,6 +3,7 @@
 //! See `docs/hardware-peripherals-design.md` for the full design.
 
 pub mod device;
+pub mod gpio;
 pub mod protocol;
 pub mod registry;
 pub mod transport;
@@ -45,8 +46,6 @@ pub mod aardvark_tools;
 #[cfg(feature = "hardware")]
 pub mod datasheet;
 
-pub mod gpio;
-
 /// Raspberry Pi self-discovery and native GPIO tools.
 /// Only compiled on Linux with the `peripheral-rpi` feature.
 #[cfg(all(feature = "peripheral-rpi", target_os = "linux"))]
@@ -61,6 +60,14 @@ pub mod tool_registry;
 #[cfg(feature = "hardware")]
 #[allow(unused_imports)]
 pub use aardvark::AardvarkTransport;
+
+#[allow(unused_imports)]
+pub use tool_registry::{ToolError, ToolRegistry};
+use crate::config::Config;
+use anyhow::Result;
+
+// Re-export config types so wizard can use `hardware::HardwareConfig` etc.
+pub use crate::config::{HardwareConfig, HardwareTransport};
 #[allow(unused_imports)]
 pub use device::{
     Device, DeviceCapabilities, DeviceContext, DeviceKind, DeviceRegistry, DeviceRuntime,
@@ -68,25 +75,20 @@ pub use device::{
 };
 #[allow(unused_imports)]
 pub use gpio::{gpio_tools, GpioReadTool, GpioWriteTool};
-#[cfg(feature = "hardware")]
-#[allow(unused_imports)]
-pub use pico_code::{device_code_tools, DeviceExecTool, DeviceReadCodeTool, DeviceWriteCodeTool};
 #[allow(unused_imports)]
 pub use protocol::{ZcCommand, ZcResponse};
-#[allow(unused_imports)]
-pub use tool_registry::{ToolError, ToolRegistry};
 #[allow(unused_imports)]
 pub use transport::{Transport, TransportError, TransportKind};
 
 #[cfg(feature = "hardware")]
 #[allow(unused_imports)]
+pub use pico_code::{device_code_tools, DeviceExecTool, DeviceReadCodeTool, DeviceWriteCodeTool};
+#[cfg(feature = "hardware")]
+#[allow(unused_imports)]
+pub use pico_flash::PicoFlashTool;
+#[cfg(feature = "hardware")]
+#[allow(unused_imports)]
 pub use serial::HardwareSerialTransport;
-
-use crate::config::Config;
-use anyhow::Result;
-
-// Re-export config types so wizard can use `hardware::HardwareConfig` etc.
-pub use crate::config::{HardwareConfig, HardwareTransport};
 
 // ── Phase 5: boot() — hardware tool integration into agent loop ───────────────
 
