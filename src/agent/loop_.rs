@@ -336,6 +336,10 @@ tokio::task_local! {
     static TOOL_LOOP_CANARY_TOKENS_ENABLED: bool;
 }
 
+tokio::task_local! {
+    pub(crate) static TOOL_CHOICE_OVERRIDE: Option<String>;
+}
+
 const AUTO_CRON_DELIVERY_CHANNELS: &[&str] = &[
     "telegram",
     "discord",
