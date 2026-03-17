@@ -69,6 +69,7 @@ pub struct NodeInfo {
 /// Events emitted by the control plane.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)]
 pub enum ControlEvent {
     /// A node registered
     NodeRegistered {
